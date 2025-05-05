@@ -1,0 +1,397 @@
+import pyodbc
+import pandas as pd
+from typing import Dict, List, Optional, Union, Tuple
+
+class SentimentDictionaryDB:
+    """Class for managing sentiment dictionaries in SQL Server."""
+    
+    def __init__(self, connection_string: str):
+        """
+        Initialize the database connection.
+        
+        Args:
+            connection_string: SQL Server connection string
+        """
+        self.conn_str = connection_string
+        self.conn = None
+        self.cursor = None
+        
+    def connect(self) -> None:
+        """Establish connection to SQL Server."""
+        try:
+            self.conn = pyodbc.connect(self.conn_str)
+            self.cursor = self.conn.cursor()
+            print("Connected to SQL Server successfully.")
+        except Exception as e:
+            print(f"Error connecting to database: {e}")
+            raise
+            
+    def disconnect(self) -> None:
+        """Close the database connection."""
+        if self.cursor:
+            self.cursor.close()
+        if self.conn:
+            self.conn.close()
+            print("Disconnected from SQL Server.")
+            
+    def __enter__(self):
+        """Context manager entry point."""
+        self.connect()
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit point."""
+        self.disconnect()
+
+    def create_schema(self) -> None:
+        """Create the necessary tables for sentiment dictionaries if they don't exist."""
+        try:
+            # Create dictionary metadata table
+            self.cursor.execute("""
+                IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'sentiment_dictionaries')
+                BEGIN
+                    CREATE TABLE sentiment_dictionaries (
+                        dictionary_id INT IDENTITY(1,1) PRIMARY KEY,
+                        dictionary_name NVARCHAR(255) NOT NULL UNIQUE,
+                        description NVARCHAR(MAX),
+                        created_date DATETIME DEFAULT GETDATE(),
+                        modified_date DATETIME DEFAULT GETDATE(),
+                        version NVARCHAR(50),
+                        source NVARCHAR(255)
+                    )
+                END
+            """)
+            
+            # Create dictionary entries table
+            self.cursor.execute("""
+                IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'sentiment_entries')
+                BEGIN
+                    CREATE TABLE sentiment_entries (
+                        entry_id INT IDENTITY(1,1) PRIMARY KEY,
+                        dictionary_id INT NOT NULL,
+                        term NVARCHAR(255) NOT NULL,
+                        sentiment_score FLOAT NOT NULL,
+                        category NVARCHAR(100),
+                        intensity FLOAT,
+                        CONSTRAINT FK_dictionary_id FOREIGN KEY (dictionary_id)
+                        REFERENCES sentiment_dictionaries(dictionary_id),
+                        CONSTRAINT UQ_term_dictionary UNIQUE(term, dictionary_id)
+                    )
+                END
+            """)
+            
+            # Create appropriate indexes
+            self.cursor.execute("""
+                IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_sentiment_entries_term')
+                BEGIN
+                    CREATE INDEX IX_sentiment_entries_term ON sentiment_entries(term)
+                END
+            """)
+            
+            self.conn.commit()
+            print("Schema created successfully.")
+        except Exception as e:
+            self.conn.rollback()
+            print(f"Error creating schema: {e}")
+            raise
+    
+    def add_dictionary(self, name: str, description: Optional[str] = None, 
+                      version: Optional[str] = None, source: Optional[str] = None) -> int:
+       
+        try:
+            self.cursor.execute("""
+                INSERT INTO sentiment_dictionaries 
+                (dictionary_name, description, version, source)
+                VALUES (?, ?, ?, ?)
+            """, (name, description, version, source))
+            
+            # Get the ID of the newly inserted dictionary
+            self.cursor.execute("SELECT @@IDENTITY")
+            dictionary_id = self.cursor.fetchone()[0]
+            
+            self.conn.commit()
+            print(f"Dictionary '{name}' added with ID {dictionary_id}")
+            return dictionary_id
+        except Exception as e:
+            self.conn.rollback()
+            print(f"Error adding dictionary: {e}")
+            raise
+    
+    def add_entries(self, dictionary_id: int, entries: Dict[str, float], 
+                   categories: Optional[Dict[str, str]] = None,
+                   intensities: Optional[Dict[str, float]] = None) -> int:
+      
+        try:
+            count = 0
+            for term, score in entries.items():
+                category = categories.get(term) if categories else None
+                intensity = intensities.get(term) if intensities else None
+                
+                self.cursor.execute("""
+                    IF NOT EXISTS (SELECT 1 FROM sentiment_entries 
+                                  WHERE dictionary_id = ? AND term = ?)
+                    BEGIN
+                        INSERT INTO sentiment_entries 
+                        (dictionary_id, term, sentiment_score, category, intensity)
+                        VALUES (?, ?, ?, ?, ?)
+                    END
+                    ELSE
+                    BEGIN
+                        UPDATE sentiment_entries
+                        SET sentiment_score = ?, category = ?, intensity = ?
+                        WHERE dictionary_id = ? AND term = ?
+                    END
+                """, (
+                    dictionary_id, term,  # For the IF NOT EXISTS check
+                    dictionary_id, term, score, category, intensity,  # For INSERT
+                    score, category, intensity, dictionary_id, term  # For UPDATE
+                ))
+                count += 1
+                
+                # Commit in batches to avoid long transactions
+                if count % 1000 == 0:
+                    self.conn.commit()
+                    print(f"Processed {count} entries...")
+            
+            # Final commit for any remaining entries
+            self.conn.commit()
+            print(f"Added/updated {count} entries to dictionary ID {dictionary_id}")
+            return count
+        except Exception as e:
+            self.conn.rollback()
+            print(f"Error adding entries: {e}")
+            raise
+    
+    def get_dictionaries(self) -> pd.DataFrame:
+        """
+        Get a list of all available sentiment dictionaries.
+        
+        Returns:
+            DataFrame of dictionaries
+        """
+        return pd.read_sql("SELECT * FROM sentiment_dictionaries", self.conn)
+    
+    def get_dictionary_by_name(self, name: str) -> Tuple[int, str, str]:
+        """
+        Get dictionary ID and metadata by name.
+        
+        Args:
+            name: Name of the dictionary
+            
+        Returns:
+            Tuple of (dictionary_id, name, description)
+        """
+        self.cursor.execute("""
+            SELECT dictionary_id, dictionary_name, description 
+            FROM sentiment_dictionaries 
+            WHERE dictionary_name = ?
+        """, (name,))
+        result = self.cursor.fetchone()
+        
+        if result:
+            return result
+        else:
+            raise ValueError(f"Dictionary '{name}' not found")
+    
+    def get_entries(self, dictionary_id: int, 
+                    limit: Optional[int] = None, 
+                    offset: Optional[int] = 0) -> pd.DataFrame:
+        """
+        Get entries from a sentiment dictionary.
+        
+        Args:
+            dictionary_id: ID of the dictionary to retrieve entries from
+            limit: Optional limit on the number of entries to retrieve
+            offset: Optional offset for pagination
+            
+        Returns:
+            DataFrame of dictionary entries
+        """
+        query = "SELECT * FROM sentiment_entries WHERE dictionary_id = ?"
+        params = [dictionary_id]
+        
+        if limit is not None:
+            query += f" ORDER BY entry_id OFFSET ? ROWS FETCH NEXT ? ROWS ONLY"
+            params.extend([offset, limit])
+            
+        return pd.read_sql(query, self.conn, params=params)
+    
+    def get_sentiment(self, dictionary_id: int, terms: List[str]) -> Dict[str, float]:
+        """
+        Get sentiment scores for specific terms.
+        
+        Args:
+            dictionary_id: ID of the dictionary to use
+            terms: List of terms to look up
+            
+        Returns:
+            Dictionary mapping terms to their sentiment scores
+        """
+        # Create a temporary table for the terms
+        try:
+            self.cursor.execute("CREATE TABLE #terms (term NVARCHAR(255))")
+            
+            # Insert the terms into the temp table
+            for term in terms:
+                self.cursor.execute("INSERT INTO #terms (term) VALUES (?)", (term,))
+            
+            # Join with the sentiment entries
+            query = """
+                SELECT t.term, se.sentiment_score
+                FROM #terms t
+                LEFT JOIN sentiment_entries se ON t.term = se.term
+                WHERE se.dictionary_id = ?
+            """
+            
+            results = {}
+            self.cursor.execute(query, (dictionary_id,))
+            for row in self.cursor.fetchall():
+                results[row.term] = row.sentiment_score
+                
+            # Drop the temp table
+            self.cursor.execute("DROP TABLE #terms")
+            
+            return results
+        except Exception as e:
+            if '#terms' in str(e):
+                self.cursor.execute("IF OBJECT_ID('tempdb..#terms') IS NOT NULL DROP TABLE #terms")
+            self.conn.rollback()
+            print(f"Error getting sentiment: {e}")
+            raise
+    
+    def import_from_csv(self, dictionary_name: str, csv_path: str, 
+                        term_col: str = 'term', score_col: str = 'score',
+                        category_col: Optional[str] = None, 
+                        intensity_col: Optional[str] = None,
+                        description: Optional[str] = None,
+                        version: Optional[str] = None,
+                        source: Optional[str] = None) -> int:
+        """
+        Import a sentiment dictionary from a CSV file.
+        
+        Args:
+            dictionary_name: Name for the new dictionary
+            csv_path: Path to the CSV file
+            term_col: Column name for terms
+            score_col: Column name for sentiment scores
+            category_col: Optional column name for categories
+            intensity_col: Optional column name for intensities
+            description: Optional description for the dictionary
+            version: Optional version info
+            source: Optional source information
+            
+        Returns:
+            ID of the created dictionary
+        """
+        try:
+            # Read the CSV file
+            df = pd.read_csv(csv_path)
+            
+            # Create a new dictionary
+            dictionary_id = self.add_dictionary(
+                dictionary_name, description, version, source
+            )
+            
+            # Prepare the entries
+            entries = dict(zip(df[term_col], df[score_col]))
+            
+            # Prepare optional category and intensity dictionaries
+            categories = None
+            if category_col and category_col in df.columns:
+                categories = dict(zip(df[term_col], df[category_col]))
+                
+            intensities = None
+            if intensity_col and intensity_col in df.columns:
+                intensities = dict(zip(df[term_col], df[intensity_col]))
+            
+            # Add the entries
+            self.add_entries(dictionary_id, entries, categories, intensities)
+            
+            return dictionary_id
+        except Exception as e:
+            print(f"Error importing from CSV: {e}")
+            raise
+    
+    def export_to_csv(self, dictionary_id: int, csv_path: str) -> None:
+        """
+        Export a sentiment dictionary to a CSV file.
+        
+        Args:
+            dictionary_id: ID of the dictionary to export
+            csv_path: Path to save the CSV file to
+        """
+        try:
+            # Get the dictionary entries
+            entries_df = self.get_entries(dictionary_id)
+            
+            # Write to CSV
+            entries_df.to_csv(csv_path, index=False)
+            print(f"Dictionary exported to {csv_path}")
+        except Exception as e:
+            print(f"Error exporting to CSV: {e}")
+            raise
+
+# Example usage
+def example_usage():
+    # Connection string - replace with your actual server details
+    conn_str = (
+        "DRIVER={ODBC Driver 17 for SQL Server};"
+        "SERVER=YourServer;"
+        "DATABASE=YourDatabase;"
+        "UID=YourUsername;"
+        "PWD=YourPassword;"
+        "Trusted_Connection=yes;"  # For Windows authentication
+    )
+    
+    # Using context manager for automatic connection handling
+    with SentimentDictionaryDB(conn_str) as db:
+        # Create the schema if it doesn't exist
+        db.create_schema()
+        
+        # Example: Create a new sentiment dictionary
+        dictionary_id = db.add_dictionary(
+            name="VADER Sentiment",
+            description="Valence Aware Dictionary and sEntiment Reasoner",
+            version="1.0",
+            source="https://github.com/cjhutto/vaderSentiment"
+        )
+        
+        # Example: Add entries to the dictionary
+        entries = {
+            "good": 0.8,
+            "bad": -0.7,
+            "excellent": 0.9,
+            "terrible": -0.9,
+            "okay": 0.2
+        }
+        
+        categories = {
+            "good": "positive",
+            "bad": "negative",
+            "excellent": "positive",
+            "terrible": "negative",
+            "okay": "neutral"
+        }
+        
+        db.add_entries(dictionary_id, entries, categories)
+        
+        # Example: Retrieve dictionaries
+        dictionaries = db.get_dictionaries()
+        print(dictionaries)
+        
+        # Example: Get entries from a dictionary
+        entries = db.get_entries(dictionary_id, limit=10)
+        print(entries)
+        
+        # Example: Get sentiment for specific terms
+        sentiments = db.get_sentiment(dictionary_id, ["good", "bad", "unknown"])
+        print(sentiments)
+        
+        # Example: Import from CSV (if you have a CSV file)
+        # db.import_from_csv("New Dictionary", "path/to/sentiment.csv")
+        
+        # Example: Export to CSV
+        # db.export_to_csv(dictionary_id, "path/to/export.csv")
+
+if __name__ == "__main__":
+    example_usage()
