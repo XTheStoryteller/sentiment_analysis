@@ -1,0 +1,130 @@
+import pandas as pd
+import re
+import unicodedata
+from nltk.stem import WordNetLemmatizer
+from rapidfuzz import process, fuzz
+
+# Load dataset
+file_path = "data/Text Data.csv"
+df = pd.read_csv(file_path, encoding='latin1')
+
+# Initialize lemmatizer
+lemmatizer = WordNetLemmatizer()
+
+# Define data cleaning functions
+def clean_text(text):
+    if pd.isna(text) or not isinstance(text, str):
+        return ""
+    
+    # Convert to lowercase
+    text = text.lower()
+    
+    # Remove non-alphanumeric characters (except spaces)
+    text = re.sub(r'[^\w\s]', ' ', text)
+    
+    # Normalize unicode characters
+    text = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8')
+    
+    # Remove extra whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+# Clean the response column
+df['cleaned_response'] = df['dp_response'].apply(clean_text)
+
+# Define category mappings based on actual `dp_response` text
+category_dict = {
+    "Seasonal(section)": ["seasonal", "holiday aisle", "seasonal inline", "valentine section", "valentine", "v-day"],
+    "Somewhere else in Store": ["aisle", "inline", "endcap", "placed inline", "different aisle", "baking centre", 
+                                "baking center", "candy", "islander", "not located", "flexed", "condensing", 
+                                "checkout", "register", "front of store", "check lanes"],
+    "Not on Planogram/Mod": ["not on mod", "not on modular", "mod removed", "fixture not set", "mod not built","no mod",
+                              "not on", "set to", "modular", "no plano"],
+    "Not in stock": ["sold out", "no stock", "out of stock", "zero on hand", "product discontinued", 
+                     "no backstock", "sold through", "zeroed", "down this week",
+                     "gone", "wiped out", "no product", "none left", "set/sold out", "low inventory", "shopped out"],
+    "Not Traited": ["not traited", "not carried", "not in assortment", "store does not trait", "not set", 
+                    "sold down", "sold through", "not treated", "cant find", "not tainted", "does not", "brand only"],
+    "Product is there": ["found it", "already on shelf", "checked and available", "islander", "store has", "stocking at time"],
+    "Product is flexed into other displays": ["flexed", "promo stand", "secondary display", "placed on endcap", "mixed",
+                                              "cartrail", "front entrance", "lindt pallet", "action alley", "clearance", 
+                                              "ghirardelli", "saddle bag", "grab n", "tiered table", "feature wall", 
+                                              "top of", "front wall", "broke down", "worked in", "side cap", "sidewall"],
+    "No Facility": ["no shelf", "no section", "no space", "store size", "no display", "no bake", "no room", "back room", 
+                    "no spot", "no place"],
+    "Not there due to seasonal": ["seasonal change", "rotation", "removed", "holiday change", "valentine", "easter"],
+    "Store Remodeling": ["store under remodel", "store in remodel", "remodeling", "store changed layout", 
+                         "store still setting up", "reset", "replaced"],
+    "Not Set Yet": ["not set yet", "setting up", "not built yet"],
+    "Not Trained": ["not trained"]
+}
+
+# Clean the dictionary keywords too for consistency
+clean_category_dict = {}
+for category, keywords in category_dict.items():
+    clean_category_dict[category] = [clean_text(keyword) for keyword in keywords]
+
+# Function to classify text and return all possible matching categories
+def classify_text(response, category_dict, lemmatizer, threshold=65):  
+    if pd.isna(response) or not isinstance(response, str) or response == "":
+        return "Uncertain", "Uncertain"
+
+    words = response.split()  
+    words = [lemmatizer.lemmatize(word) for word in words]  
+
+    matched_categories = set() 
+    best_match = None 
+    best_score = 0  
+
+    for category, keywords in category_dict.items():
+        for word in words:
+            # Skip empty or too short words
+            if len(word) < 2:
+                continue
+                
+            match, score, _ = process.extractOne(word, keywords, scorer=fuzz.ratio)
+            if score >= threshold:
+                matched_categories.add(category)  # Add category if it matches
+                if score > best_score:
+                    best_score = score
+                    best_match = category  
+
+    # Also check the whole response against each keyword
+    for category, keywords in category_dict.items():
+        for keyword in keywords:
+            if keyword in response:
+                matched_categories.add(category)
+                # If it's an exact match, prioritize it
+                if best_score < 100:
+                    best_score = 100
+                    best_match = category
+
+    matched_categories_str = ", ".join(matched_categories) if matched_categories else "Uncertain"
+    best_match = best_match if best_match else "Uncertain"
+
+    return best_match, matched_categories_str
+
+# Apply classification to cleaned dataset
+df[["classified_category", "all_categories"]] = df["cleaned_response"].apply(
+    lambda x: pd.Series(classify_text(x, clean_category_dict, lemmatizer))
+)
+
+# Add a confidence column based on whether the classification is "Uncertain"
+df["classification_confidence"] = df["classified_category"].apply(
+    lambda x: "Low" if x == "Uncertain" else "High"
+)
+
+# Save the results to a new CSV file
+output_file = "data/classified_final_fuzzy_multi_cleaned.csv"
+df.to_csv(output_file, index=False)
+
+print(f"Classification completed! Results saved to {output_file}")
+
+# Print some statistics on the classification results
+category_counts = df["classified_category"].value_counts()
+print("\nCategory Distribution:")
+print(category_counts)
+
+uncertain_percentage = (category_counts.get("Uncertain", 0) / len(df)) * 100
+print(f"\nUncertain classifications: {uncertain_percentage:.2f}%")
